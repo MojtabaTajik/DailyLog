@@ -29,7 +29,8 @@ Rules:
 - Use bullet points under each section. If there is nothing to put in a section, leave a single "-" as a placeholder.
 - Do not add, invent, or infer information that was not provided.
 - Do not add any text outside of these five sections.
-- Preserve the original meaning and wording as closely as possible.
+- Fix all grammar, spelling, and punctuation errors while preserving the original meaning.
+- Rewrite entries in clear, fluent English — correct typos, incomplete words, and awkward phrasing.
 - Output only the markdown, no preamble or explanation.`
 
 // Config holds all runtime configuration for the dailylog bot.
