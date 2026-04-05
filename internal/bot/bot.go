@@ -106,7 +106,7 @@ func (b *Bot) handleDaily(c tele.Context) error {
 	existing, err := b.store.Load(now)
 	if err != nil {
 		log.Printf("load note: %v", err)
-		b.react(c, "⚠")
+		b.react(c, "🤮")
 		return nil
 	}
 
@@ -118,13 +118,13 @@ func (b *Bot) handleDaily(c tele.Context) error {
 	refined, err := b.refiner.Refine(ctx, merged)
 	if err != nil {
 		log.Printf("groq refine: %v", err)
-		b.react(c, "⚠")
+		b.react(c, "🤮")
 		return nil
 	}
 
 	if err := b.store.Save(now, refined); err != nil {
 		log.Printf("save note: %v", err)
-		b.react(c, "⚠")
+		b.react(c, "🤮")
 		return nil
 	}
 
