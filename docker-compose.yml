@@ -1,0 +1,13 @@
+services:
+  dailylog:
+    build: .
+    image: dailylog:latest
+    container_name: dailylog
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DAILY_NOTES_PATH: /notes
+    user: "${UID:-1000}:${GID:-1000}"
+    volumes:
+      - ${NOTES_HOST_PATH}:/notes
