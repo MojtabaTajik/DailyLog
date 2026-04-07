@@ -18,19 +18,11 @@ const defaultGroqSystemPrompt = `You are a daily notes assistant. The user will 
 ## Roamler
 -
 
-## Learned
--
-
-## Win of the day
--
-
 Rules:
 - Place each piece of information under the most relevant section.
 - Use bullet points under each section. If there is nothing to put in a section, leave a single "-" as a placeholder.
 - Do not invent facts or events that were not provided.
-- For the Learned section, extract insights or lessons implied by the user's experience, even if not explicitly stated as a learning. If the user dealt with a problem, discovered something, or gained a new perspective, capture that as a concise takeaway.
-- For Win of the day, pick the most meaningful accomplishment or positive moment from the day. A personal win counts just as much as a work win.
-- Do not add any text outside of these five sections.
+- Do not add any text outside of these three sections.
 - Fix all grammar, spelling, and punctuation errors while preserving the original meaning.
 - The user may write in English, Persian, or a mix — always output in clear, fluent English.
 - Correct typos, incomplete words, and awkward phrasing.
