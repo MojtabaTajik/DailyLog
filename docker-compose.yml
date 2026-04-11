@@ -4,6 +4,8 @@ services:
     image: dailylog:latest
     container_name: dailylog
     restart: unless-stopped
+    labels:
+      - "com.centurylinklabs.watchtower.enable=false"
     env_file:
       - .env
     environment:
