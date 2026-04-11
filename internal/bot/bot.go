@@ -65,10 +65,12 @@ func (b *Bot) Start() {
 func (b *Bot) registerHandlers() {
 	b.tele.Use(b.onlyAuthorizedChat)
 
-	b.tele.Handle("/log", b.handleDaily)
+	// This bot is dedicated to daily notes: every plain text message is
+	// treated as a note to append. /help and /start remain as explicit
+	// commands so the user can always discover what the bot does.
 	b.tele.Handle("/help", b.handleHelp)
 	b.tele.Handle("/start", b.handleHelp)
-	b.tele.Handle(tele.OnText, b.handleFallback)
+	b.tele.Handle(tele.OnText, b.handleDaily)
 }
 
 // onlyAuthorizedChat is middleware that drops any update whose chat ID
@@ -85,20 +87,17 @@ func (b *Bot) onlyAuthorizedChat(next tele.HandlerFunc) tele.HandlerFunc {
 
 func (b *Bot) handleHelp(c tele.Context) error {
 	return c.Send(strings.Join([]string{
-		"dailylog commands:",
-		"/log <note> — append a note to today's log and refine it",
+		"dailylog bot:",
+		"Send any text message and it will be appended to today's log and refined into the fixed section structure.",
 		"/help — show this message",
 	}, "\n"))
 }
 
-func (b *Bot) handleFallback(c tele.Context) error {
-	return c.Send("Use /log <note> to log your daily note.")
-}
-
 func (b *Bot) handleDaily(c tele.Context) error {
-	text := strings.TrimSpace(c.Message().Payload)
+	// Every non‑command text message is treated as a daily note.
+	text := strings.TrimSpace(c.Message().Text)
 	if text == "" {
-		return c.Send("Usage: /log <your note>")
+		return nil
 	}
 
 	now := time.Now().UTC()
@@ -110,7 +109,7 @@ func (b *Bot) handleDaily(c tele.Context) error {
 		return nil
 	}
 
-	merged := notes.AppendEntry(existing, text, now)
+	merged := notes.AppendEntry(existing, text)
 
 	ctx, cancel := context.WithTimeout(context.Background(), groqTimeout)
 	defer cancel()

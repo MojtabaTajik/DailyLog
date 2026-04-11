@@ -56,13 +56,15 @@ func (s *Store) Save(t time.Time, content string) error {
 	return nil
 }
 
-// AppendEntry merges a new timestamped entry into the existing content.
-// The resulting string is what should be handed to the AI refiner.
-func AppendEntry(existing, text string, t time.Time) string {
-	header := fmt.Sprintf("## %s", t.Format("15:04"))
-	entry := header + "\n" + text + "\n"
+// AppendEntry merges a new entry into the existing refined note content.
+// The resulting string is what should be handed to the AI refiner, which
+// is responsible for integrating the new raw text into the fixed section
+// structure. We deliberately do NOT emit any markdown heading for the new
+// entry: a heading would look like a new section to the refiner and cause
+// it to either drop content or embed the header text into bullets.
+func AppendEntry(existing, text string) string {
 	if existing == "" {
-		return fmt.Sprintf("# %s\n\n%s", t.Format("2006-01-02"), entry)
+		return text
 	}
-	return existing + "\n" + entry
+	return existing + "\n\n" + text
 }
