@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/mojix/dailylog/internal/config"
@@ -13,9 +14,18 @@ import (
 )
 
 const (
-	previewLimit   = 200
-	groqTimeout    = 90 * time.Second
-	pollingTimeout = 10 * time.Second
+	previewLimit    = 200
+	groqTimeout     = 90 * time.Second
+	pollingTimeout  = 10 * time.Second
+	pendingTTL      = 30 * time.Minute
+	cleanupInterval = 5 * time.Minute
+)
+
+// Inline buttons attached to each note prompt. The Unique field is what
+// telebot uses to route the callback back to the correct handler.
+var (
+	btnYesterday = tele.Btn{Unique: "note_yesterday", Text: "Yesterday"}
+	btnToday     = tele.Btn{Unique: "note_today", Text: "Today"}
 )
 
 // Refiner is the subset of the Groq client used by the bot. Defining it
@@ -31,12 +41,22 @@ type NoteStore interface {
 	Save(t time.Time, content string) error
 }
 
+// pendingNote holds a note awaiting the user's day-selection click.
+type pendingNote struct {
+	text        string
+	userMessage *tele.Message
+	createdAt   time.Time
+}
+
 // Bot wires together Telegram, the note store, and the AI refiner.
 type Bot struct {
 	cfg     *config.Config
 	tele    *tele.Bot
 	store   NoteStore
 	refiner Refiner
+
+	pendingMu sync.Mutex
+	pending   map[int]*pendingNote
 }
 
 // New constructs a Bot and registers handlers. It returns an error if
@@ -52,8 +72,15 @@ func New(cfg *config.Config, store NoteStore, refiner Refiner) (*Bot, error) {
 		return nil, fmt.Errorf("telebot init: %w", err)
 	}
 
-	b := &Bot{cfg: cfg, tele: tb, store: store, refiner: refiner}
+	b := &Bot{
+		cfg:     cfg,
+		tele:    tb,
+		store:   store,
+		refiner: refiner,
+		pending: make(map[int]*pendingNote),
+	}
 	b.registerHandlers()
+	go b.cleanupLoop()
 	return b, nil
 }
 
@@ -71,6 +98,9 @@ func (b *Bot) registerHandlers() {
 	b.tele.Handle("/help", b.handleHelp)
 	b.tele.Handle("/start", b.handleHelp)
 	b.tele.Handle(tele.OnText, b.handleDaily)
+
+	b.tele.Handle(&btnToday, b.handleDayChoice(0))
+	b.tele.Handle(&btnYesterday, b.handleDayChoice(-1))
 }
 
 // onlyAuthorizedChat is middleware that drops any update whose chat ID
@@ -88,54 +118,135 @@ func (b *Bot) onlyAuthorizedChat(next tele.HandlerFunc) tele.HandlerFunc {
 func (b *Bot) handleHelp(c tele.Context) error {
 	return c.Send(strings.Join([]string{
 		"dailylog bot:",
-		"Send any text message and it will be appended to today's log and refined into the fixed section structure.",
+		"Send any text message and the bot will ask whether to file it under Today or Yesterday, then append and refine it.",
 		"/help — show this message",
 	}, "\n"))
 }
 
 func (b *Bot) handleDaily(c tele.Context) error {
-	// Every non‑command text message is treated as a daily note.
+	// Every non‑command text message is treated as a daily note awaiting
+	// a day-selection from the user.
 	text := strings.TrimSpace(c.Message().Text)
 	if text == "" {
 		return nil
 	}
 
-	now := time.Now().UTC()
+	markup := &tele.ReplyMarkup{}
+	markup.Inline(markup.Row(btnYesterday, btnToday))
 
-	existing, err := b.store.Load(now)
+	prompt, err := c.Bot().Send(
+		c.Chat(),
+		"📝 File this note under:",
+		&tele.SendOptions{
+			ReplyTo:     c.Message(),
+			ReplyMarkup: markup,
+		},
+	)
 	if err != nil {
-		log.Printf("load note: %v", err)
-		b.react(c, "🤮")
+		log.Printf("send day prompt: %v", err)
+		b.react(c.Message(), "🤮")
 		return nil
 	}
 
-	merged := notes.AppendEntry(existing, text)
-
-	ctx, cancel := context.WithTimeout(context.Background(), groqTimeout)
-	defer cancel()
-
-	refined, err := b.refiner.Refine(ctx, merged)
-	if err != nil {
-		log.Printf("groq refine: %v", err)
-		b.react(c, "🤮")
-		return nil
+	b.pendingMu.Lock()
+	b.pending[prompt.ID] = &pendingNote{
+		text:        text,
+		userMessage: c.Message(),
+		createdAt:   time.Now(),
 	}
+	b.pendingMu.Unlock()
 
-	if err := b.store.Save(now, refined); err != nil {
-		log.Printf("save note: %v", err)
-		b.react(c, "🤮")
-		return nil
-	}
-
-	b.react(c, "👍")
 	return nil
 }
 
-// react sends an emoji reaction on the message using the raw Bot API.
-func (b *Bot) react(c tele.Context, emoji string) {
+// handleDayChoice returns a callback handler that files the pending note
+// into the date offset by dayOffset days from "now" (0 = today, -1 = yesterday).
+func (b *Bot) handleDayChoice(dayOffset int) tele.HandlerFunc {
+	return func(c tele.Context) error {
+		// Acknowledge the callback so Telegram clears the spinner on the
+		// user's button. We don't care if this fails — it's UX polish.
+		_ = c.Respond()
+
+		cb := c.Callback()
+		if cb == nil || cb.Message == nil {
+			return nil
+		}
+		promptID := cb.Message.ID
+
+		b.pendingMu.Lock()
+		pending, ok := b.pending[promptID]
+		if ok {
+			delete(b.pending, promptID)
+		}
+		b.pendingMu.Unlock()
+
+		if !ok {
+			_ = c.Edit("⚠️ This note expired. Send it again.", &tele.ReplyMarkup{})
+			return nil
+		}
+
+		target := time.Now().UTC().AddDate(0, 0, dayOffset)
+		dateLabel := target.Format("2006-01-02")
+
+		existing, err := b.store.Load(target)
+		if err != nil {
+			log.Printf("load note: %v", err)
+			_ = c.Edit("🤮 Failed to load "+dateLabel, &tele.ReplyMarkup{})
+			b.react(pending.userMessage, "🤮")
+			return nil
+		}
+
+		merged := notes.AppendEntry(existing, pending.text)
+
+		ctx, cancel := context.WithTimeout(context.Background(), groqTimeout)
+		defer cancel()
+
+		refined, err := b.refiner.Refine(ctx, merged)
+		if err != nil {
+			log.Printf("groq refine: %v", err)
+			_ = c.Edit("🤮 Refine failed for "+dateLabel, &tele.ReplyMarkup{})
+			b.react(pending.userMessage, "🤮")
+			return nil
+		}
+
+		if err := b.store.Save(target, refined); err != nil {
+			log.Printf("save note: %v", err)
+			_ = c.Edit("🤮 Save failed for "+dateLabel, &tele.ReplyMarkup{})
+			b.react(pending.userMessage, "🤮")
+			return nil
+		}
+
+		_ = c.Delete()
+		b.react(pending.userMessage, "👌")
+		return nil
+	}
+}
+
+// cleanupLoop periodically evicts pending notes whose prompt the user
+// never answered, so the map doesn't grow without bound.
+func (b *Bot) cleanupLoop() {
+	ticker := time.NewTicker(cleanupInterval)
+	defer ticker.Stop()
+	for range ticker.C {
+		cutoff := time.Now().Add(-pendingTTL)
+		b.pendingMu.Lock()
+		for id, note := range b.pending {
+			if note.createdAt.Before(cutoff) {
+				delete(b.pending, id)
+			}
+		}
+		b.pendingMu.Unlock()
+	}
+}
+
+// react sends an emoji reaction on the given message using the raw Bot API.
+func (b *Bot) react(msg *tele.Message, emoji string) {
+	if msg == nil {
+		return
+	}
 	params := map[string]interface{}{
-		"chat_id":    c.Chat().ID,
-		"message_id": c.Message().ID,
+		"chat_id":    msg.Chat.ID,
+		"message_id": msg.ID,
 		"reaction":   []map[string]string{{"type": "emoji", "emoji": emoji}},
 	}
 	if _, err := b.tele.Raw("setMessageReaction", params); err != nil {
