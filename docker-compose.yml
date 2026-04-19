@@ -10,5 +10,6 @@ services:
       - .env
     environment:
       DAILY_NOTES_PATH: /notes
+    user: "${UID:-1000}:${GID:-1000}"
     volumes:
       - ${NOTES_HOST_PATH}:/notes
