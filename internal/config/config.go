@@ -123,7 +123,7 @@ func Load() (*Config, error) {
 	}
 
 	if cfg.GroqTranscribeModel == "" {
-		cfg.GroqTranscribeModel = "whisper-large-v3-turbo"
+		cfg.GroqTranscribeModel = "whisper-large-v3"
 	}
 
 	if err := cfg.validate(); err != nil {
