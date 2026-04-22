@@ -87,23 +87,25 @@ Example output (notice: one rich bullet for the whole decoration project, not ni
 // Values are sourced from environment variables so the binary can be
 // operated identically in local and containerized environments.
 type Config struct {
-	TelegramToken    string
-	TelegramChatID   int64
-	DailyNotesPath   string
-	GroqAPIKey       string
-	GroqModel        string
-	GroqSystemPrompt string
+	TelegramToken       string
+	TelegramChatID      int64
+	DailyNotesPath      string
+	GroqAPIKey          string
+	GroqModel           string
+	GroqTranscribeModel string
+	GroqSystemPrompt    string
 }
 
 // Load reads configuration from the process environment and validates
 // that all mandatory fields are present.
 func Load() (*Config, error) {
 	cfg := &Config{
-		TelegramToken:    os.Getenv("TELEGRAM_TOKEN"),
-		DailyNotesPath:   os.Getenv("DAILY_NOTES_PATH"),
-		GroqAPIKey:       os.Getenv("GROQ_API_KEY"),
-		GroqModel:        os.Getenv("GROQ_MODEL"),
-		GroqSystemPrompt: os.Getenv("GROQ_SYSTEM_PROMPT"),
+		TelegramToken:       os.Getenv("TELEGRAM_TOKEN"),
+		DailyNotesPath:      os.Getenv("DAILY_NOTES_PATH"),
+		GroqAPIKey:          os.Getenv("GROQ_API_KEY"),
+		GroqModel:           os.Getenv("GROQ_MODEL"),
+		GroqTranscribeModel: os.Getenv("GROQ_TRANSCRIBE_MODEL"),
+		GroqSystemPrompt:    os.Getenv("GROQ_SYSTEM_PROMPT"),
 	}
 
 	chatIDRaw := os.Getenv("TELEGRAM_CHAT_ID")
@@ -118,6 +120,10 @@ func Load() (*Config, error) {
 
 	if cfg.GroqSystemPrompt == "" {
 		cfg.GroqSystemPrompt = defaultGroqSystemPrompt
+	}
+
+	if cfg.GroqTranscribeModel == "" {
+		cfg.GroqTranscribeModel = "whisper-large-v3-turbo"
 	}
 
 	if err := cfg.validate(); err != nil {

@@ -3,6 +3,7 @@ package bot
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"strings"
 	"sync"
@@ -14,11 +15,12 @@ import (
 )
 
 const (
-	previewLimit    = 200
-	groqTimeout     = 90 * time.Second
-	pollingTimeout  = 10 * time.Second
-	pendingTTL      = 30 * time.Minute
-	cleanupInterval = 5 * time.Minute
+	previewLimit      = 200
+	groqTimeout       = 90 * time.Second
+	transcribeTimeout = 120 * time.Second
+	pollingTimeout    = 10 * time.Second
+	pendingTTL        = 30 * time.Minute
+	cleanupInterval   = 5 * time.Minute
 )
 
 // Inline buttons attached to each note prompt. The Unique field is what
@@ -33,6 +35,12 @@ var (
 // trivial to swap or stub in tests.
 type Refiner interface {
 	Refine(ctx context.Context, raw string) (string, error)
+}
+
+// Transcriber converts an audio stream to text. filename must carry a
+// Whisper-recognized extension (e.g. ".ogg" for Telegram voice notes).
+type Transcriber interface {
+	Transcribe(ctx context.Context, audio io.Reader, filename string) (string, error)
 }
 
 // NoteStore is the persistence contract the bot depends on.
@@ -50,10 +58,11 @@ type pendingNote struct {
 
 // Bot wires together Telegram, the note store, and the AI refiner.
 type Bot struct {
-	cfg     *config.Config
-	tele    *tele.Bot
-	store   NoteStore
-	refiner Refiner
+	cfg         *config.Config
+	tele        *tele.Bot
+	store       NoteStore
+	refiner     Refiner
+	transcriber Transcriber
 
 	pendingMu sync.Mutex
 	pending   map[int]*pendingNote
@@ -61,7 +70,7 @@ type Bot struct {
 
 // New constructs a Bot and registers handlers. It returns an error if
 // the underlying Telegram client cannot be initialized.
-func New(cfg *config.Config, store NoteStore, refiner Refiner) (*Bot, error) {
+func New(cfg *config.Config, store NoteStore, refiner Refiner, transcriber Transcriber) (*Bot, error) {
 	settings := tele.Settings{
 		Token:  cfg.TelegramToken,
 		Poller: &tele.LongPoller{Timeout: pollingTimeout},
@@ -73,11 +82,12 @@ func New(cfg *config.Config, store NoteStore, refiner Refiner) (*Bot, error) {
 	}
 
 	b := &Bot{
-		cfg:     cfg,
-		tele:    tb,
-		store:   store,
-		refiner: refiner,
-		pending: make(map[int]*pendingNote),
+		cfg:         cfg,
+		tele:        tb,
+		store:       store,
+		refiner:     refiner,
+		transcriber: transcriber,
+		pending:     make(map[int]*pendingNote),
 	}
 	b.registerHandlers()
 	go b.cleanupLoop()
@@ -98,6 +108,7 @@ func (b *Bot) registerHandlers() {
 	b.tele.Handle("/help", b.handleHelp)
 	b.tele.Handle("/start", b.handleHelp)
 	b.tele.Handle(tele.OnText, b.handleDaily)
+	b.tele.Handle(tele.OnVoice, b.handleVoice)
 
 	b.tele.Handle(&btnToday, b.handleDayChoice(0))
 	b.tele.Handle(&btnYesterday, b.handleDayChoice(-1))
@@ -118,7 +129,7 @@ func (b *Bot) onlyAuthorizedChat(next tele.HandlerFunc) tele.HandlerFunc {
 func (b *Bot) handleHelp(c tele.Context) error {
 	return c.Send(strings.Join([]string{
 		"dailylog bot:",
-		"Send any text message and the bot will ask whether to file it under Today or Yesterday, then append and refine it.",
+		"Send a text message or a voice note and the bot will ask whether to file it under Today or Yesterday, then append and refine it.",
 		"/help — show this message",
 	}, "\n"))
 }
@@ -130,13 +141,55 @@ func (b *Bot) handleDaily(c tele.Context) error {
 	if text == "" {
 		return nil
 	}
+	return b.startPendingNote(c, text, "📝 File this note under:")
+}
 
+func (b *Bot) handleVoice(c tele.Context) error {
+	voice := c.Message().Voice
+	if voice == nil {
+		return nil
+	}
+
+	reader, err := c.Bot().File(&voice.File)
+	if err != nil {
+		log.Printf("download voice: %v", err)
+		b.react(c.Message(), "🤮")
+		return nil
+	}
+	defer reader.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), transcribeTimeout)
+	defer cancel()
+
+	// Telegram voice notes are Opus in an Ogg container; ".ogg" is in
+	// Whisper's accepted extension list.
+	text, err := b.transcriber.Transcribe(ctx, reader, "voice.ogg")
+	if err != nil {
+		log.Printf("transcribe voice: %v", err)
+		b.react(c.Message(), "🤮")
+		return nil
+	}
+
+	text = strings.TrimSpace(text)
+	if text == "" {
+		b.react(c.Message(), "🤔")
+		return nil
+	}
+
+	prompt := fmt.Sprintf("🎙️ Transcribed:\n%s\n\n📝 File this note under:", text)
+	return b.startPendingNote(c, text, prompt)
+}
+
+// startPendingNote sends the day-selection prompt and stashes the note
+// text against the prompt's message ID so the callback handler can find
+// it when the user taps Yesterday or Today.
+func (b *Bot) startPendingNote(c tele.Context, text, promptMessage string) error {
 	markup := &tele.ReplyMarkup{}
 	markup.Inline(markup.Row(btnYesterday, btnToday))
 
 	prompt, err := c.Bot().Send(
 		c.Chat(),
-		"📝 File this note under:",
+		promptMessage,
 		&tele.SendOptions{
 			ReplyTo:     c.Message(),
 			ReplyMarkup: markup,

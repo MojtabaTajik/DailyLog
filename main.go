@@ -16,9 +16,9 @@ func main() {
 	}
 
 	store := notes.NewStore(cfg.DailyNotesPath)
-	groqClient := groq.NewClient(cfg.GroqAPIKey, cfg.GroqModel, cfg.GroqSystemPrompt)
+	groqClient := groq.NewClient(cfg.GroqAPIKey, cfg.GroqModel, cfg.GroqTranscribeModel, cfg.GroqSystemPrompt)
 
-	b, err := bot.New(cfg, store, groqClient)
+	b, err := bot.New(cfg, store, groqClient, groqClient)
 	if err != nil {
 		log.Fatalf("bot init: %v", err)
 	}
