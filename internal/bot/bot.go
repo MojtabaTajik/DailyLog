@@ -50,9 +50,12 @@ type NoteStore interface {
 }
 
 // pendingNote holds a note awaiting the user's day-selection click.
+// reactTarget is the message that receives status reactions — for voice
+// notes this is the transcription reply, for text notes it's the user's
+// message itself.
 type pendingNote struct {
 	text        string
-	userMessage *tele.Message
+	reactTarget *tele.Message
 	createdAt   time.Time
 }
 
@@ -141,7 +144,7 @@ func (b *Bot) handleDaily(c tele.Context) error {
 	if text == "" {
 		return nil
 	}
-	return b.startPendingNote(c, text, "📝 File this note under:")
+	return b.startPendingNote(c, text, c.Message(), "📝 File this note under:")
 }
 
 func (b *Bot) handleVoice(c tele.Context) error {
@@ -176,14 +179,28 @@ func (b *Bot) handleVoice(c tele.Context) error {
 		return nil
 	}
 
-	prompt := fmt.Sprintf("🎙️ Transcribed:\n%s\n\n📝 File this note under:", text)
-	return b.startPendingNote(c, text, prompt)
+	// Post the transcription as a standalone reply to the voice so it
+	// stays visible alongside the voice after the day-selection prompt
+	// is deleted. Status reactions land on this message, not the voice,
+	// so the emoji sits next to readable text.
+	transcript, err := c.Bot().Send(
+		c.Chat(),
+		"🎙️ "+text,
+		&tele.SendOptions{ReplyTo: c.Message()},
+	)
+	if err != nil {
+		log.Printf("send transcription: %v", err)
+		b.react(c.Message(), "🤮")
+		return nil
+	}
+
+	return b.startPendingNote(c, text, transcript, "📝 File this note under:")
 }
 
 // startPendingNote sends the day-selection prompt and stashes the note
 // text against the prompt's message ID so the callback handler can find
 // it when the user taps Yesterday or Today.
-func (b *Bot) startPendingNote(c tele.Context, text, promptMessage string) error {
+func (b *Bot) startPendingNote(c tele.Context, text string, reactTarget *tele.Message, promptMessage string) error {
 	markup := &tele.ReplyMarkup{}
 	markup.Inline(markup.Row(btnYesterday, btnToday))
 
@@ -197,14 +214,14 @@ func (b *Bot) startPendingNote(c tele.Context, text, promptMessage string) error
 	)
 	if err != nil {
 		log.Printf("send day prompt: %v", err)
-		b.react(c.Message(), "🤮")
+		b.react(reactTarget, "🤮")
 		return nil
 	}
 
 	b.pendingMu.Lock()
 	b.pending[prompt.ID] = &pendingNote{
 		text:        text,
-		userMessage: c.Message(),
+		reactTarget: reactTarget,
 		createdAt:   time.Now(),
 	}
 	b.pendingMu.Unlock()
@@ -245,7 +262,7 @@ func (b *Bot) handleDayChoice(dayOffset int) tele.HandlerFunc {
 		if err != nil {
 			log.Printf("load note: %v", err)
 			_ = c.Edit("🤮 Failed to load "+dateLabel, &tele.ReplyMarkup{})
-			b.react(pending.userMessage, "🤮")
+			b.react(pending.reactTarget, "🤮")
 			return nil
 		}
 
@@ -258,19 +275,19 @@ func (b *Bot) handleDayChoice(dayOffset int) tele.HandlerFunc {
 		if err != nil {
 			log.Printf("groq refine: %v", err)
 			_ = c.Edit("🤮 Refine failed for "+dateLabel, &tele.ReplyMarkup{})
-			b.react(pending.userMessage, "🤮")
+			b.react(pending.reactTarget, "🤮")
 			return nil
 		}
 
 		if err := b.store.Save(target, refined); err != nil {
 			log.Printf("save note: %v", err)
 			_ = c.Edit("🤮 Save failed for "+dateLabel, &tele.ReplyMarkup{})
-			b.react(pending.userMessage, "🤮")
+			b.react(pending.reactTarget, "🤮")
 			return nil
 		}
 
 		_ = c.Delete()
-		b.react(pending.userMessage, "👌")
+		b.react(pending.reactTarget, "👌")
 		return nil
 	}
 }
