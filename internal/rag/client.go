@@ -28,8 +28,9 @@ func NewClient(baseURL string) *Client {
 }
 
 type indexRequest struct {
-	Key     string `json:"key"`
-	Content string `json:"content"`
+	Key        string `json:"key"`
+	Content    string `json:"content"`
+	RebuildFTS bool   `json:"rebuild_fts"`
 }
 
 // IndexResult reports what the sidecar did with an /index call.
@@ -39,16 +40,24 @@ type IndexResult struct {
 	Hash    string `json:"hash"`
 }
 
-// Index upserts the chunks for key. The sidecar deletes any prior
-// chunks for the same key and re-embeds the new content. If the
-// content hash matches what is already indexed, the sidecar skips
-// work and returns Skipped=true.
-func (c *Client) Index(ctx context.Context, key, content string) (IndexResult, error) {
+// Index upserts the chunks for key. If the content hash matches what
+// is already indexed, the sidecar skips work and returns Skipped=true.
+// Pass rebuildFTS=false during bulk reindex and call RebuildFTS once
+// at the end to avoid hundreds of full FTS rebuilds.
+func (c *Client) Index(ctx context.Context, key, content string, rebuildFTS bool) (IndexResult, error) {
 	var resp IndexResult
-	if err := c.post(ctx, "/index", indexRequest{Key: key, Content: content}, &resp); err != nil {
+	body := indexRequest{Key: key, Content: content, RebuildFTS: rebuildFTS}
+	if err := c.post(ctx, "/index", body, &resp); err != nil {
 		return IndexResult{}, err
 	}
 	return resp, nil
+}
+
+// RebuildFTS forces a rebuild of the BM25 full-text index. Use after
+// a bulk reindex that called Index with rebuildFTS=false.
+func (c *Client) RebuildFTS(ctx context.Context) error {
+	var resp map[string]string
+	return c.post(ctx, "/rebuild-fts", struct{}{}, &resp)
 }
 
 type queryRequest struct {

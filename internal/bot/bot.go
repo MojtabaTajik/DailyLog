@@ -2,6 +2,8 @@ package bot
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"log"
@@ -49,9 +51,10 @@ type Answerer interface {
 
 // RagClient is the subset of the RAG sidecar used by the bot.
 type RagClient interface {
-	Index(ctx context.Context, date, content string) (rag.IndexResult, error)
+	Index(ctx context.Context, key, content string, rebuildFTS bool) (rag.IndexResult, error)
 	Query(ctx context.Context, q string, k int) ([]rag.Hit, error)
 	Status(ctx context.Context) (map[string]string, error)
+	RebuildFTS(ctx context.Context) error
 }
 
 // Transcriber converts an audio stream to text. filename must carry a
@@ -255,6 +258,16 @@ func (b *Bot) handleReindex(c tele.Context) error {
 	go func() {
 		defer reindexInFlight.Unlock()
 
+		// Fetch the existing index state once so we can skip unchanged
+		// files locally without sending them over HTTP to the sidecar.
+		statusCtx, cancelStatus := context.WithTimeout(context.Background(), ragQueryTimeout)
+		known, err := b.rag.Status(statusCtx)
+		cancelStatus()
+		if err != nil {
+			log.Printf("reindex status fetch: %v", err)
+			known = map[string]string{}
+		}
+
 		var indexed, skipped, failed, total int
 		lastEdit := time.Now()
 
@@ -272,8 +285,21 @@ func (b *Bot) handleReindex(c tele.Context) error {
 		walkErr := b.vault.Walk(func(e notes.VaultEntry) error {
 			total++
 
+			// Client-side skip: hash the file locally and compare with
+			// the sidecar's known hash. Avoids the per-file scan on
+			// the sidecar entirely for unchanged files.
+			h := sha256.Sum256([]byte(e.Content))
+			localHash := hex.EncodeToString(h[:])
+			if known[e.Key] == localHash {
+				skipped++
+				updateStatus(false)
+				return nil
+			}
+
 			ctx, cancel := context.WithTimeout(context.Background(), ragIndexTimeout)
-			res, err := b.rag.Index(ctx, e.Key, e.Content)
+			// Defer FTS rebuild: one final call after the loop is much
+			// cheaper than rebuilding on every insert.
+			res, err := b.rag.Index(ctx, e.Key, e.Content, false)
 			cancel()
 
 			switch {
@@ -288,6 +314,16 @@ func (b *Bot) handleReindex(c tele.Context) error {
 			updateStatus(false)
 			return nil
 		})
+
+		// Rebuild the FTS index once, after all inserts are done.
+		// Skip if nothing was actually inserted.
+		if indexed > 0 {
+			fctx, fcancel := context.WithTimeout(context.Background(), ragIndexTimeout)
+			if err := b.rag.RebuildFTS(fctx); err != nil {
+				log.Printf("reindex rebuild-fts: %v", err)
+			}
+			fcancel()
+		}
 
 		final := fmt.Sprintf("✅ Reindex done: %d total, %d new, %d skipped, %d failed", total, indexed, skipped, failed)
 		if walkErr != nil {
@@ -317,7 +353,9 @@ func (b *Bot) indexSavedNote(t time.Time, content string) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), ragIndexTimeout)
 		defer cancel()
-		res, err := b.rag.Index(ctx, key, content)
+		// Single-file path: rebuild FTS inline so the new note is
+		// immediately searchable.
+		res, err := b.rag.Index(ctx, key, content, true)
 		switch {
 		case err != nil:
 			log.Printf("rag index %s: %v", key, err)

@@ -9,6 +9,7 @@ for that key and inserts the new ones.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import os
 import re
@@ -64,17 +65,20 @@ def chunk_markdown(text: str, size: int = 800, overlap: int = 120) -> list[str]:
 
 
 async def embed_batch(client: httpx.AsyncClient, texts: list[str]) -> list[list[float]]:
-    """Call Ollama once per text. nomic-embed-text returns a 768-dim vector."""
-    out: list[list[float]] = []
-    for t in texts:
+    """Embed all texts concurrently. Ollama serializes them internally
+    on CPU, but firing requests in parallel still avoids the per-call
+    HTTP round-trip cost piling up sequentially.
+    """
+    async def _one(t: str) -> list[float]:
         r = await client.post(
             f"{OLLAMA_HOST}/api/embeddings",
             json={"model": EMBED_MODEL, "prompt": t},
             timeout=60.0,
         )
         r.raise_for_status()
-        out.append(r.json()["embedding"])
-    return out
+        return r.json()["embedding"]
+
+    return list(await asyncio.gather(*(_one(t) for t in texts)))
 
 
 REQUIRED_FIELDS = {"text", "vector", "key", "chunk_id", "content_hash"}
@@ -161,6 +165,10 @@ app = FastAPI(lifespan=lifespan)
 class IndexRequest(BaseModel):
     key: str = Field(..., description="Opaque identifier, e.g. note path relative to vault root")
     content: str
+    rebuild_fts: bool = Field(
+        True,
+        description="Rebuild the BM25 full-text index after this insert. Set to false during bulk reindex and call /rebuild-fts once at the end.",
+    )
 
 
 class QueryRequest(BaseModel):
@@ -210,9 +218,19 @@ async def index(req: IndexRequest) -> dict[str, Any]:
         for i, (c, v) in enumerate(zip(chunks, vectors))
     ]
     table.add(rows)
-    ensure_fts_index(table)
-    log.info("indexed %d chunks for %s", len(rows), req.key)
+    if req.rebuild_fts:
+        ensure_fts_index(table)
+    log.info("indexed %d chunks for %s (fts_rebuilt=%s)", len(rows), req.key, req.rebuild_fts)
     return {"chunks": len(rows), "skipped": False, "hash": new_hash}
+
+
+@app.post("/rebuild-fts")
+async def rebuild_fts() -> dict[str, str]:
+    """Rebuild the BM25 full-text index. Call this once at the end of
+    a bulk reindex when /index was invoked with rebuild_fts=false.
+    """
+    ensure_fts_index(state["table"])
+    return {"status": "ok"}
 
 
 @app.get("/status")
