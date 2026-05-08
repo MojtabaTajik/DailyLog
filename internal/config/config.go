@@ -94,6 +94,8 @@ type Config struct {
 	GroqModel           string
 	GroqTranscribeModel string
 	GroqSystemPrompt    string
+	RagServiceURL       string
+	VaultPath           string
 }
 
 // Load reads configuration from the process environment and validates
@@ -106,6 +108,8 @@ func Load() (*Config, error) {
 		GroqModel:           os.Getenv("GROQ_MODEL"),
 		GroqTranscribeModel: os.Getenv("GROQ_TRANSCRIBE_MODEL"),
 		GroqSystemPrompt:    os.Getenv("GROQ_SYSTEM_PROMPT"),
+		RagServiceURL:       os.Getenv("RAG_SERVICE_URL"),
+		VaultPath:           os.Getenv("VAULT_PATH"),
 	}
 
 	chatIDRaw := os.Getenv("TELEGRAM_CHAT_ID")
@@ -142,6 +146,8 @@ func (c *Config) validate() error {
 		return errors.New("GROQ_API_KEY is required")
 	case c.GroqModel == "":
 		return errors.New("GROQ_MODEL is required")
+	case c.RagServiceURL != "" && c.VaultPath == "":
+		return errors.New("VAULT_PATH is required when RAG_SERVICE_URL is set")
 	}
 	return nil
 }

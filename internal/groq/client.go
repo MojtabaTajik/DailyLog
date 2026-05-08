@@ -60,11 +60,33 @@ type chatResponse struct {
 
 // Refine sends the raw markdown to Groq and returns the refined output.
 func (c *Client) Refine(ctx context.Context, rawMarkdown string) (string, error) {
+	return c.chat(ctx, c.systemPrompt, rawMarkdown)
+}
+
+const answerSystemPrompt = `You are a personal-notes assistant answering questions about the user's own Obsidian vault.
+You will be given a question and a set of CONTEXT excerpts from the user's notes.
+
+Rules:
+1. Answer using ONLY the provided context. If the answer is not in the context, say you could not find it in the notes.
+2. Be concise. One short paragraph or a few bullets.
+3. Do not include source paths, dates, or citations in the answer.
+4. Never invent details that are not in the context.
+5. Reply in the same language the question is asked in.`
+
+// Answer runs a retrieval-augmented chat: the question plus a formatted
+// context block are sent to the same chat model. Caller supplies the
+// already-formatted context (date headers + chunk text).
+func (c *Client) Answer(ctx context.Context, question, contextBlock string) (string, error) {
+	user := "CONTEXT:\n" + contextBlock + "\n\nQUESTION: " + question
+	return c.chat(ctx, answerSystemPrompt, user)
+}
+
+func (c *Client) chat(ctx context.Context, system, user string) (string, error) {
 	reqBody := chatRequest{
 		Model: c.model,
 		Messages: []message{
-			{Role: "system", Content: c.systemPrompt},
-			{Role: "user", Content: rawMarkdown},
+			{Role: "system", Content: system},
+			{Role: "user", Content: user},
 		},
 	}
 

@@ -9,7 +9,61 @@ services:
     env_file:
       - .env
     environment:
-      DAILY_NOTES_PATH: /notes
+      VAULT_PATH: /vault
+      RAG_SERVICE_URL: http://rag:8000
+      # Daily notes live at /vault/<DAILY_NOTES_SUBDIR>. Override
+      # DAILY_NOTES_SUBDIR in .env if your vault uses a different name
+      # (e.g. "journal" or "Daily").
+      DAILY_NOTES_PATH: /vault/${DAILY_NOTES_SUBDIR:-Daily notes}
     user: "${UID:-1000}:${GID:-1000}"
     volumes:
-      - ${NOTES_HOST_PATH}:/notes
+      - ${VAULT_HOST_PATH}:/vault
+    depends_on:
+      rag:
+        condition: service_healthy
+
+  rag:
+    build: ./rag-service
+    image: dailylog-rag:latest
+    container_name: dailylog-rag
+    restart: unless-stopped
+    environment:
+      LANCEDB_PATH: /data/lancedb
+      OLLAMA_HOST: http://ollama:11434
+      EMBED_MODEL: nomic-embed-text
+    volumes:
+      - rag-data:/data
+    depends_on:
+      ollama:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: dailylog-ollama
+    restart: unless-stopped
+    volumes:
+      - ollama-data:/root/.ollama
+    # Pull the embedding model on first start, then run the server.
+    entrypoint: ["/bin/sh", "-c"]
+    command: >
+      "ollama serve &
+       SERVER_PID=$$!;
+       until ollama list >/dev/null 2>&1; do sleep 1; done;
+       ollama pull nomic-embed-text;
+       wait $$SERVER_PID"
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+
+volumes:
+  rag-data:
+  ollama-data:
