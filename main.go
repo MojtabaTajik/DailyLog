@@ -28,7 +28,7 @@ func main() {
 		log.Println("rag disabled (RAG_SERVICE_URL not set)")
 	}
 
-	b, err := bot.New(cfg, store, vault, groqClient, groqClient, groqClient, ragClient)
+	b, err := bot.New(cfg, store, vault, groqClient, groqClient, groqClient, groqClient, ragClient)
 	if err != nil {
 		log.Fatalf("bot init: %v", err)
 	}

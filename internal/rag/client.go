@@ -61,8 +61,10 @@ func (c *Client) RebuildFTS(ctx context.Context) error {
 }
 
 type queryRequest struct {
-	Q string `json:"q"`
-	K int    `json:"k"`
+	Q        string `json:"q"`
+	K        int    `json:"k"`
+	DateFrom string `json:"date_from,omitempty"`
+	DateTo   string `json:"date_to,omitempty"`
 }
 
 // Hit is one retrieved chunk plus its source key.
@@ -77,13 +79,16 @@ type queryResponse struct {
 	Hits []Hit `json:"hits"`
 }
 
-// Query embeds q and returns up to k nearest chunks.
-func (c *Client) Query(ctx context.Context, q string, k int) ([]Hit, error) {
+// Query embeds q and returns up to k nearest chunks. Pass dateFrom/dateTo
+// (inclusive YYYY-MM-DD strings, either may be empty) to restrict the
+// search to a date range; an empty string disables that bound.
+func (c *Client) Query(ctx context.Context, q string, k int, dateFrom, dateTo string) ([]Hit, error) {
 	if k <= 0 {
 		k = 6
 	}
 	var resp queryResponse
-	if err := c.post(ctx, "/query", queryRequest{Q: q, K: k}, &resp); err != nil {
+	body := queryRequest{Q: q, K: k, DateFrom: dateFrom, DateTo: dateTo}
+	if err := c.post(ctx, "/query", body, &resp); err != nil {
 		return nil, err
 	}
 	return resp.Hits, nil

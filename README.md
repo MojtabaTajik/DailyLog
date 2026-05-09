@@ -56,7 +56,7 @@ A Telegram bot that turns text and voice messages into a refined daily log insid
 
 ## Operational notes
 
-- The sidecar auto-migrates: if the LanceDB schema changes between releases, the table is dropped on startup and the index rebuilds on the next `/reindex`.
+- The sidecar auto-migrates: if the LanceDB schema changes between releases, the table is dropped on startup and the index rebuilds on the next `/reindex`. **After upgrading to a release that added the `date` / `section` / `weekday` columns, run `/reindex` once so existing notes pick up the new metadata.**
 - Indexing on save runs in a background goroutine; failures are logged but never block the user.
 - Hybrid search uses BM25 (FTS) plus dense (vector) retrieval, fused with reciprocal-rank fusion. The FTS index is rebuilt at startup and after every `/index` insert.
 - The bot only responds to `TELEGRAM_CHAT_ID`. Any other chat is silently dropped.

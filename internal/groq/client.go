@@ -8,6 +8,7 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -64,12 +65,12 @@ func (c *Client) Refine(ctx context.Context, rawMarkdown string) (string, error)
 }
 
 const answerSystemPrompt = `You are a personal-notes assistant answering questions about the user's own Obsidian vault.
-You will be given a question and a set of CONTEXT excerpts from the user's notes.
+You will be given a question and a set of CONTEXT excerpts from the user's notes. Each excerpt may begin with a "Date: YYYY-MM-DD (Day)" line and a "Section: ..." line; treat those as authoritative metadata for the bullet text that follows.
 
 Rules:
 1. Answer using ONLY the provided context. If the answer is not in the context, say you could not find it in the notes.
 2. Be concise. One short paragraph or a few bullets.
-3. Do not include source paths, dates, or citations in the answer.
+3. When the user asks about timing, dates, weeks, or "when", cite the relevant date(s) from the context (e.g. "On 2025-05-08 you..."). Do not cite file paths.
 4. Never invent details that are not in the context.
 5. Reply in the same language the question is asked in.`
 
@@ -79,6 +80,42 @@ Rules:
 func (c *Client) Answer(ctx context.Context, question, contextBlock string) (string, error) {
 	user := "CONTEXT:\n" + contextBlock + "\n\nQUESTION: " + question
 	return c.chat(ctx, answerSystemPrompt, user)
+}
+
+const rewriteSystemPrompt = `You rewrite a user's question into a small JSON envelope used by a personal-notes search system.
+
+Output strictly a JSON object of the form:
+{"queries": ["..."], "date_from": "YYYY-MM-DD", "date_to": "YYYY-MM-DD"}
+
+Rules:
+- "queries": 1 to 3 short keyword-focused search strings derived from the question. Expand vague pronouns ("the thing", "that one") into the most likely concrete noun. Spell out abbreviations. Drop filler words. Keep proper nouns and project names verbatim.
+- "date_from" / "date_to": inclusive ISO range if the user clearly references a time period; otherwise empty strings. Do not invent a range.
+- Reply with the JSON object only. No preamble, no markdown, no code fences.`
+
+// Rewrite asks the model to expand a terse question into search-ready
+// strings and an optional date range. Returns scalars rather than a
+// struct so the bot's Rewriter interface stays decoupled from this
+// package.
+func (c *Client) Rewrite(ctx context.Context, question string) (queries []string, dateFrom, dateTo string, err error) {
+	raw, err := c.chat(ctx, rewriteSystemPrompt, question)
+	if err != nil {
+		return nil, "", "", err
+	}
+	cleaned := strings.TrimSpace(raw)
+	cleaned = strings.TrimPrefix(cleaned, "```json")
+	cleaned = strings.TrimPrefix(cleaned, "```")
+	cleaned = strings.TrimSuffix(cleaned, "```")
+	cleaned = strings.TrimSpace(cleaned)
+
+	var parsed struct {
+		Queries  []string `json:"queries"`
+		DateFrom string   `json:"date_from"`
+		DateTo   string   `json:"date_to"`
+	}
+	if err := json.Unmarshal([]byte(cleaned), &parsed); err != nil {
+		return nil, "", "", fmt.Errorf("decode rewrite: %w (raw=%q)", err, raw)
+	}
+	return parsed.Queries, parsed.DateFrom, parsed.DateTo, nil
 }
 
 func (c *Client) chat(ctx context.Context, system, user string) (string, error) {

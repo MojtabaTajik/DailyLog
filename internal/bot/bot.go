@@ -1,6 +1,7 @@
 package bot
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -18,7 +19,6 @@ import (
 )
 
 const (
-	previewLimit      = 200
 	groqTimeout       = 90 * time.Second
 	transcribeTimeout = 120 * time.Second
 	pollingTimeout    = 10 * time.Second
@@ -26,8 +26,13 @@ const (
 	cleanupInterval   = 5 * time.Minute
 	ragIndexTimeout   = 60 * time.Second
 	ragQueryTimeout   = 30 * time.Second
+	rewriteTimeout    = 15 * time.Second
 	ragTopK           = 6
 	queryPrefix       = "?"
+	maxBypassDays     = 14
+	maxRewriteRunes   = 200
+	telegramReplyMax  = 4000
+	ftsDebounce       = 5 * time.Second
 )
 
 // Inline buttons attached to each note prompt. The Unique field is what
@@ -49,10 +54,17 @@ type Answerer interface {
 	Answer(ctx context.Context, question, contextBlock string) (string, error)
 }
 
+// Rewriter expands a terse user question into 1-3 search queries plus
+// an optional date range. An empty queries slice or empty dates means
+// "no useful expansion"; the caller should fall back to the raw input.
+type Rewriter interface {
+	Rewrite(ctx context.Context, question string) (queries []string, dateFrom, dateTo string, err error)
+}
+
 // RagClient is the subset of the RAG sidecar used by the bot.
 type RagClient interface {
 	Index(ctx context.Context, key, content string, rebuildFTS bool) (rag.IndexResult, error)
-	Query(ctx context.Context, q string, k int) ([]rag.Hit, error)
+	Query(ctx context.Context, q string, k int, dateFrom, dateTo string) ([]rag.Hit, error)
 	Status(ctx context.Context) (map[string]string, error)
 	RebuildFTS(ctx context.Context) error
 }
@@ -79,7 +91,7 @@ type Vault interface {
 }
 
 // pendingNote holds a note awaiting the user's day-selection click.
-// reactTarget is the message that receives status reactions — for voice
+// reactTarget is the message that receives status reactions: for voice
 // notes this is the transcription reply, for text notes it's the user's
 // message itself.
 type pendingNote struct {
@@ -96,17 +108,32 @@ type Bot struct {
 	vault       Vault
 	refiner     Refiner
 	answerer    Answerer
+	rewriter    Rewriter // may be nil to disable query rewriting
 	transcriber Transcriber
 	rag         RagClient // may be nil if RAG is not configured
 
 	pendingMu sync.Mutex
 	pending   map[int]*pendingNote
+
+	// FTS rebuild debouncing: many sequential single-note saves produce
+	// one rebuild instead of N.
+	ftsMu    sync.Mutex
+	ftsTimer *time.Timer
 }
 
 // New constructs a Bot and registers handlers. It returns an error if
-// the underlying Telegram client cannot be initialized. ragClient may
-// be nil to disable indexing and the ? query path.
-func New(cfg *config.Config, store NoteStore, vault Vault, refiner Refiner, answerer Answerer, transcriber Transcriber, ragClient RagClient) (*Bot, error) {
+// the underlying Telegram client cannot be initialized. ragClient and
+// rewriter may both be nil to disable indexing/expansion.
+func New(
+	cfg *config.Config,
+	store NoteStore,
+	vault Vault,
+	refiner Refiner,
+	answerer Answerer,
+	rewriter Rewriter,
+	transcriber Transcriber,
+	ragClient RagClient,
+) (*Bot, error) {
 	settings := tele.Settings{
 		Token:  cfg.TelegramToken,
 		Poller: &tele.LongPoller{Timeout: pollingTimeout},
@@ -124,6 +151,7 @@ func New(cfg *config.Config, store NoteStore, vault Vault, refiner Refiner, answ
 		vault:       vault,
 		refiner:     refiner,
 		answerer:    answerer,
+		rewriter:    rewriter,
 		transcriber: transcriber,
 		rag:         ragClient,
 		pending:     make(map[int]*pendingNote),
@@ -141,9 +169,6 @@ func (b *Bot) Start() {
 func (b *Bot) registerHandlers() {
 	b.tele.Use(b.onlyAuthorizedChat)
 
-	// This bot is dedicated to daily notes: every plain text message is
-	// treated as a note to append. /help and /start remain as explicit
-	// commands so the user can always discover what the bot does.
 	b.tele.Handle("/help", b.handleHelp)
 	b.tele.Handle("/start", b.handleHelp)
 	b.tele.Handle("/reindex", b.handleReindex)
@@ -181,16 +206,18 @@ func (b *Bot) handleDaily(c tele.Context) error {
 	if text == "" {
 		return nil
 	}
-	// Messages beginning with ? are RAG queries against the notes index.
-	// Everything else is a daily note awaiting day-selection.
 	if strings.HasPrefix(text, queryPrefix) {
 		return b.handleQuery(c, strings.TrimSpace(strings.TrimPrefix(text, queryPrefix)))
 	}
 	return b.startPendingNote(c, text, c.Message(), "📝 File this note under:")
 }
 
-// handleQuery runs retrieval against the RAG sidecar, sends the question
-// plus retrieved context to the answerer, and replies with the answer.
+// handleQuery answers a `?` question. Three paths, in order:
+//  1. If the question references a small date range (≤ maxBypassDays),
+//     load those daily notes directly and skip retrieval entirely.
+//  2. Otherwise, optionally ask the rewriter to expand the question
+//     into a search-friendly form plus a possible ISO date range.
+//  3. Run the rag sidecar and answer from its hits.
 func (b *Bot) handleQuery(c tele.Context, question string) error {
 	if b.rag == nil || b.answerer == nil {
 		return c.Reply("🤔 RAG is not configured. Set RAG_SERVICE_URL.")
@@ -201,10 +228,42 @@ func (b *Bot) handleQuery(c tele.Context, question string) error {
 
 	b.react(c.Message(), "👀")
 
+	now := time.Now().Local()
+	parseFrom, parseTo, parseOK := parseTemporalRange(question, now)
+
+	if parseOK {
+		days := int(parseTo.Sub(parseFrom).Hours()/24) + 1
+		if days >= 1 && days <= maxBypassDays {
+			return b.answerFromRange(c, question, parseFrom, parseTo)
+		}
+	}
+
+	rewritten := question
+	var rewriteFrom, rewriteTo string
+	if b.rewriter != nil && len([]rune(question)) <= maxRewriteRunes {
+		rwctx, rwcancel := context.WithTimeout(context.Background(), rewriteTimeout)
+		queries, df, dt, err := b.rewriter.Rewrite(rwctx, question)
+		rwcancel()
+		if err != nil {
+			log.Printf("rewrite: %v (using raw question)", err)
+		} else {
+			if len(queries) > 0 && strings.TrimSpace(queries[0]) != "" {
+				rewritten = strings.TrimSpace(queries[0])
+			}
+			rewriteFrom, rewriteTo = strings.TrimSpace(df), strings.TrimSpace(dt)
+		}
+	}
+
+	dateFrom, dateTo := rewriteFrom, rewriteTo
+	if dateFrom == "" && dateTo == "" && parseOK {
+		dateFrom = parseFrom.Format("2006-01-02")
+		dateTo = parseTo.Format("2006-01-02")
+	}
+
 	qctx, qcancel := context.WithTimeout(context.Background(), ragQueryTimeout)
 	defer qcancel()
 
-	hits, err := b.rag.Query(qctx, question, ragTopK)
+	hits, err := b.rag.Query(qctx, rewritten, ragTopK, dateFrom, dateTo)
 	if err != nil {
 		log.Printf("rag query: %v", err)
 		b.react(c.Message(), "🤮")
@@ -215,9 +274,14 @@ func (b *Bot) handleQuery(c tele.Context, question string) error {
 		return c.Reply("No matching notes found.")
 	}
 
+	// Hits already carry "Date: ..." / "Section: ..." prefixes from the
+	// sidecar, so we just glue them together with separators.
 	var contextBlock strings.Builder
-	for _, h := range hits {
-		fmt.Fprintf(&contextBlock, "[%s]\n%s\n\n", noteTitleFromKey(h.Key), h.Text)
+	for i, h := range hits {
+		if i > 0 {
+			contextBlock.WriteString("\n\n---\n\n")
+		}
+		contextBlock.WriteString(h.Text)
 	}
 
 	actx, acancel := context.WithTimeout(context.Background(), groqTimeout)
@@ -231,7 +295,51 @@ func (b *Bot) handleQuery(c tele.Context, question string) error {
 	}
 
 	b.react(c.Message(), "👌")
-	return c.Reply(answer)
+	return b.replyLong(c, answer)
+}
+
+// answerFromRange loads the daily notes for [from, to] inclusive and
+// hands them to the answerer verbatim. Used as a bypass when the user's
+// question references a small date range; faster, cheaper, and gives
+// the model the entire note rather than a few retrieved chunks.
+func (b *Bot) answerFromRange(c tele.Context, question string, from, to time.Time) error {
+	var ctxBlock strings.Builder
+	found := 0
+	for d := from; !d.After(to); d = d.AddDate(0, 0, 1) {
+		body, err := b.store.Load(d)
+		if err != nil {
+			log.Printf("range load %s: %v", d.Format("2006-01-02"), err)
+			continue
+		}
+		body = strings.TrimSpace(body)
+		if body == "" {
+			continue
+		}
+		if found > 0 {
+			ctxBlock.WriteString("\n\n---\n\n")
+		}
+		fmt.Fprintf(&ctxBlock, "Date: %s (%s)\n%s",
+			d.Format("2006-01-02"), d.Format("Mon"), body)
+		found++
+	}
+
+	if found == 0 {
+		b.react(c.Message(), "🤷")
+		return c.Reply("No notes found in that range.")
+	}
+
+	actx, acancel := context.WithTimeout(context.Background(), groqTimeout)
+	defer acancel()
+
+	answer, err := b.answerer.Answer(actx, question, ctxBlock.String())
+	if err != nil {
+		log.Printf("answer (range): %v", err)
+		b.react(c.Message(), "🤮")
+		return c.Reply("🤮 Answer failed.")
+	}
+
+	b.react(c.Message(), "👌")
+	return b.replyLong(c, answer)
 }
 
 // reindexInFlight guards against running two /reindex passes at once,
@@ -258,8 +366,6 @@ func (b *Bot) handleReindex(c tele.Context) error {
 	go func() {
 		defer reindexInFlight.Unlock()
 
-		// Fetch the existing index state once so we can skip unchanged
-		// files locally without sending them over HTTP to the sidecar.
 		statusCtx, cancelStatus := context.WithTimeout(context.Background(), ragQueryTimeout)
 		known, err := b.rag.Status(statusCtx)
 		cancelStatus()
@@ -285,9 +391,6 @@ func (b *Bot) handleReindex(c tele.Context) error {
 		walkErr := b.vault.Walk(func(e notes.VaultEntry) error {
 			total++
 
-			// Client-side skip: hash the file locally and compare with
-			// the sidecar's known hash. Avoids the per-file scan on
-			// the sidecar entirely for unchanged files.
 			h := sha256.Sum256([]byte(e.Content))
 			localHash := hex.EncodeToString(h[:])
 			if known[e.Key] == localHash {
@@ -297,8 +400,6 @@ func (b *Bot) handleReindex(c tele.Context) error {
 			}
 
 			ctx, cancel := context.WithTimeout(context.Background(), ragIndexTimeout)
-			// Defer FTS rebuild: one final call after the loop is much
-			// cheaper than rebuilding on every insert.
 			res, err := b.rag.Index(ctx, e.Key, e.Content, false)
 			cancel()
 
@@ -315,8 +416,6 @@ func (b *Bot) handleReindex(c tele.Context) error {
 			return nil
 		})
 
-		// Rebuild the FTS index once, after all inserts are done.
-		// Skip if nothing was actually inserted.
 		if indexed > 0 {
 			fctx, fcancel := context.WithTimeout(context.Background(), ragIndexTimeout)
 			if err := b.rag.RebuildFTS(fctx); err != nil {
@@ -336,10 +435,8 @@ func (b *Bot) handleReindex(c tele.Context) error {
 	return nil
 }
 
-// indexSavedNote fires the RAG indexer for a freshly saved daily note.
-// The note's vault-relative path is computed from the store's PathFor
-// and the configured vault root so the indexed key matches what
-// /reindex would produce. Errors are logged only.
+// indexSavedNote fires the RAG indexer for a freshly saved daily note,
+// then schedules a debounced FTS rebuild. Errors are logged only.
 func (b *Bot) indexSavedNote(t time.Time, content string) {
 	if b.rag == nil || b.vault == nil || b.vault.Root() == "" {
 		return
@@ -353,25 +450,40 @@ func (b *Bot) indexSavedNote(t time.Time, content string) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), ragIndexTimeout)
 		defer cancel()
-		// Single-file path: rebuild FTS inline so the new note is
-		// immediately searchable.
-		res, err := b.rag.Index(ctx, key, content, true)
+		// Rebuild_fts=false: a debounced background rebuild handles
+		// bursts of saves with one FTS pass instead of N.
+		res, err := b.rag.Index(ctx, key, content, false)
 		switch {
 		case err != nil:
 			log.Printf("rag index %s: %v", key, err)
+			return
 		case res.Skipped:
 			log.Printf("rag index %s: unchanged, skipped", key)
+			return
 		default:
 			log.Printf("rag indexed %s (%d chunks)", key, res.Chunks)
 		}
+		b.scheduleFTSRebuild()
 	}()
 }
 
-// noteTitleFromKey turns a vault-relative path into a short label used
-// in citations: drops the .md extension, keeps the parent folder for
-// disambiguation.
-func noteTitleFromKey(key string) string {
-	return strings.TrimSuffix(key, ".md")
+// scheduleFTSRebuild fires a single FTS rebuild ftsDebounce after the
+// most recent call. Subsequent calls within the window reset the timer.
+func (b *Bot) scheduleFTSRebuild() {
+	b.ftsMu.Lock()
+	defer b.ftsMu.Unlock()
+	if b.ftsTimer != nil {
+		b.ftsTimer.Stop()
+	}
+	b.ftsTimer = time.AfterFunc(ftsDebounce, func() {
+		ctx, cancel := context.WithTimeout(context.Background(), ragIndexTimeout)
+		defer cancel()
+		if err := b.rag.RebuildFTS(ctx); err != nil {
+			log.Printf("debounced fts rebuild: %v", err)
+			return
+		}
+		log.Printf("fts index rebuilt")
+	})
 }
 
 func (b *Bot) handleVoice(c tele.Context) error {
@@ -391,8 +503,6 @@ func (b *Bot) handleVoice(c tele.Context) error {
 	ctx, cancel := context.WithTimeout(context.Background(), transcribeTimeout)
 	defer cancel()
 
-	// Telegram voice notes are Opus in an Ogg container; ".ogg" is in
-	// Whisper's accepted extension list.
 	text, err := b.transcriber.Transcribe(ctx, reader, "voice.ogg")
 	if err != nil {
 		log.Printf("transcribe voice: %v", err)
@@ -406,10 +516,6 @@ func (b *Bot) handleVoice(c tele.Context) error {
 		return nil
 	}
 
-	// Post the transcription as a standalone reply to the voice so it
-	// stays visible alongside the voice after the day-selection prompt
-	// is deleted. Status reactions land on this message, not the voice,
-	// so the emoji sits next to readable text.
 	transcript, err := c.Bot().Send(
 		c.Chat(),
 		"🎙️ "+text,
@@ -460,8 +566,6 @@ func (b *Bot) startPendingNote(c tele.Context, text string, reactTarget *tele.Me
 // into the date offset by dayOffset days from "now" (0 = today, -1 = yesterday).
 func (b *Bot) handleDayChoice(dayOffset int) tele.HandlerFunc {
 	return func(c tele.Context) error {
-		// Acknowledge the callback so Telegram clears the spinner on the
-		// user's button. We don't care if this fails — it's UX polish.
 		_ = c.Respond()
 
 		cb := c.Callback()
@@ -482,7 +586,9 @@ func (b *Bot) handleDayChoice(dayOffset int) tele.HandlerFunc {
 			return nil
 		}
 
-		target := time.Now().UTC().AddDate(0, 0, dayOffset)
+		// Local time, not UTC: near-midnight messages must file under the
+		// user's local day, otherwise a 23:55 note ends up under tomorrow.
+		target := time.Now().Local().AddDate(0, 0, dayOffset)
 		dateLabel := target.Format("2006-01-02")
 
 		existing, err := b.store.Load(target)
@@ -553,12 +659,22 @@ func (b *Bot) react(msg *tele.Message, emoji string) {
 	}
 }
 
-// preview returns the first n characters of s, appending an ellipsis if
-// the string was truncated. It is rune-safe.
-func preview(s string, n int) string {
-	runes := []rune(s)
-	if len(runes) <= n {
-		return s
+// replyLong sends text as a normal reply when it fits Telegram's 4096
+// character limit; otherwise it sends the first chunk as text and the
+// remainder as a `.txt` document attachment.
+func (b *Bot) replyLong(c tele.Context, text string) error {
+	runes := []rune(text)
+	if len(runes) <= telegramReplyMax {
+		return c.Reply(text)
 	}
-	return string(runes[:n]) + "..."
+	head := string(runes[:telegramReplyMax])
+	tail := string(runes[telegramReplyMax:])
+	if err := c.Reply(head); err != nil {
+		return err
+	}
+	doc := &tele.Document{
+		File:     tele.FromReader(bytes.NewReader([]byte(tail))),
+		FileName: "answer-overflow.txt",
+	}
+	return c.Reply(doc)
 }
